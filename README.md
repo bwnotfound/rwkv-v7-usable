@@ -4,7 +4,7 @@
 2. use huggingface tokenizer
 3. change the data process so you can pass `input_ids` and `labels` for sft compatiblity
 4. add SFT (Supervised Fine-Tuning) capabilities
-5. inference available
+5. inference available (Very simple and naive for now. A few days is need for refract the model)
 
 ### Run Code
 1. ```shell

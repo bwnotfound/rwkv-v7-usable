@@ -142,10 +142,6 @@ class train_callback(L.Callback):
             dataset = dataset.datasets
         elif hasattr(dataset, "dataset"):
             dataset = dataset.dataset
-        if "MyDataset" in str(dataset):
-            dataset.global_rank = trainer.global_rank
-            dataset.real_epoch = int(args.epoch_begin + trainer.current_epoch)
-            dataset.world_size = trainer.world_size
         # print(f'########## world_size {dataset.world_size} global_rank {dataset.global_rank} real_epoch {dataset.real_epoch} ##########')
 
     def on_train_epoch_end(self, trainer, pl_module):
@@ -165,7 +161,7 @@ class train_callback(L.Callback):
 
         if trainer.is_global_zero:  # logging
             trainer.my_log.write(
-                f"{args.epoch_begin + trainer.current_epoch} {trainer.my_epoch_loss:.6f} {math.exp(trainer.my_epoch_loss):.4f} {trainer.my_lr:.8f} {datetime.datetime.now()} {trainer.current_epoch}\n"
+                f"{trainer.current_epoch} {trainer.my_epoch_loss:.6f} {math.exp(trainer.my_epoch_loss):.4f} {trainer.my_lr:.8f} {datetime.datetime.now()}\n"
             )
             trainer.my_log.flush()
 

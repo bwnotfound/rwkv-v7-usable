@@ -22,7 +22,7 @@ def __nop(ob):
 
 MyModule = nn.Module
 MyFunction = __nop
-if os.environ["RWKV_JIT_ON"] == "1":
+if os.environ.get("RWKV_JIT_ON", "0") == "1":
     MyModule = torch.jit.ScriptModule
     MyFunction = torch.jit.script_method
 
@@ -60,7 +60,9 @@ class WindBackstepping(torch.autograd.Function):
     def forward(ctx, w, q, k, v, z, b):
         B, T, H, C = w.shape
         assert T % CHUNK_LEN == 0
-        assert all(i.dtype == torch.bfloat16 for i in [w, q, k, v, z, b])
+        assert all(
+            i.dtype == torch.bfloat16 for i in [w, q, k, v, z, b]
+        ), f"w: {w.dtype}, q: {q.dtype}, k: {k.dtype}, v: {v.dtype}, z: {z.dtype}, b: {b.dtype}"
         assert all(i.is_contiguous() for i in [w, q, k, v, z, b])
         y = torch.empty_like(v)
         s = torch.empty(
@@ -73,7 +75,7 @@ class WindBackstepping(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dy):
-        assert all(i.dtype == torch.bfloat16 for i in [dy])
+        assert all(i.dtype == torch.bfloat16 for i in [dy]), f"dy: {dy.dtype}"
         assert all(i.is_contiguous() for i in [dy])
         w, q, k, v, z, b, s, sa = ctx.saved_tensors
         dw, dq, dk, dv, dz, db = [torch.empty_like(x) for x in [w, q, k, v, z, b]]
@@ -365,7 +367,10 @@ class L2Wrap(torch.autograd.Function):
 
 class RWKV(L.LightningModule):
     def __init__(
-        self, config: RWKVConfig, optim_config: OptimConfig, print_params_info=True
+        self,
+        config: RWKVConfig,
+        optim_config: OptimConfig = None,
+        print_params_info=True,
     ):
         super().__init__()
         self.config = config
@@ -501,6 +506,9 @@ class RWKV(L.LightningModule):
         x = self.ln_out(x)
         x = self.head(x)
         return x
+
+    def generate(self, idx, max_length):
+        pass
 
     def training_step(self, batch, batch_idx):
         idx, targets = batch

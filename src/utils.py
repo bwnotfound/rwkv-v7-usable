@@ -51,6 +51,7 @@ def load_checkpoint(
     checkpoint_dir,
     model,
     load_partial=False,
+    dtype=None,
 ):
     checkpoint_dir = checkpoint_dir.rstrip("/")
     if not os.path.exists(checkpoint_dir):
@@ -58,4 +59,7 @@ def load_checkpoint(
     state_dict = torch.load(
         os.path.join(checkpoint_dir, "model.pth"), map_location="cpu"
     )
+    if dtype is not None:
+        for key in state_dict.keys():
+            state_dict[key] = state_dict[key].to(dtype)
     model.from_state_dict(state_dict, load_partial=load_partial)
