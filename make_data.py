@@ -1,6 +1,10 @@
 import json
 import os
 import multiprocessing
+from concurrent.futures import ThreadPoolExecutor
+from threading import Thread
+import shutil
+import gc
 import numpy as np
 from tqdm import tqdm
 import pandas as pd
@@ -63,6 +67,45 @@ def encode_batch(tokenizer, batch, max_length):
     return result
 
 
+def run(file_path, batch_size, tokenizer_path, max_length, queue):
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    with open(file_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    wait_list = []
+    cache = []
+    for line in lines:
+        cache.append(line)
+        if len(cache) >= batch_size:
+            cache = [json.loads(x) for x in cache]
+            wait_list.append(cache)
+            cache = []
+    if len(cache) > 0:
+        cache = [json.loads(x) for x in cache]
+        wait_list.append(cache)
+
+    result = []
+    for batch in wait_list:
+        result.extend(encode_batch(tokenizer, batch, max_length))
+        queue.put(len(batch))
+    return result
+
+
+class TqdmThread(Thread):
+    def __init__(self, total, queue):
+        super().__init__()
+        self.queue = queue
+        self.total = total
+        self.tqdm = tqdm(total=total, desc="Processing")
+
+    def run(self):
+        cnt = 0
+        while cnt < self.total:
+            result = self.queue.get()
+            self.tqdm.update(result)
+            cnt += result
+
+
 """
 data format:
 {"text": "Hello world!"}
@@ -73,58 +116,68 @@ data format:
 if __name__ == "__main__":
     tokenizer_path = "models/tokenizer"
     # input_path = "data/pretrain_hq.jsonl"
-    input_path = "/root/autodl-tmp/sft_512_mini.jsonl"
+    input_path = "data/pretrain_hq.jsonl"
     output_dir = "data"
+    tem_dir = os.path.join(output_dir, "_TEMP")
+    os.makedirs(tem_dir, exist_ok=True)
     max_length = 512
     batch_size = 4000
+    pool_size = 8
 
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     output_path = os.path.join(
         output_dir, os.path.splitext(os.path.basename(input_path))[0] + ".parquet"
     )
 
-    print(f"### Convert {input_path} to {output_path}")
+    tqdm.write(f"### Convert {input_path} to {output_path}")
 
     with open(input_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
+    lines = [x for x in lines if len(x) > 0]
 
-    cache = []
+    block_size = len(lines) // pool_size
+    for i in tqdm(range(pool_size), desc="Splitting data to temporary disk"):
+        start = i * block_size
+        end = (i + 1) * block_size if i != pool_size - 1 else len(lines)
+        with open(os.path.join(tem_dir, f"{i}.txt"), "w", encoding="utf-8") as f:
+            f.writelines(lines[start:end])
+
+    tqdm.write(f"### Splitting done. Data length: {len(lines)}")
+    queue = multiprocessing.Manager().Queue()
+    TqdmThread(len(lines), queue).start()
+    del lines
+    gc.collect()
+    tqdm.write(f"### Start converting...")
+
     df_rows = []
-    wait_list = []
-    for line in tqdm(lines):
-        cache.append(line)
-        if len(cache) >= batch_size:
-            cache = [json.loads(x) for x in cache if len(x) > 0]
-            wait_list.append(cache)
-            cache = []
-            # outs = tokenizer(cache, max_length=max_length, truncation=True)["input_ids"]
-            # outs = [np.array(x) for x in outs]
-            # for out in outs:
-            #     df_rows.append({"input_ids": out[:-1], "labels": out[1:]})
-            # cache = []
     futures = []
-    with multiprocessing.Pool() as pool:
-        for batch in wait_list:
-            futures.append(
-                pool.apply_async(
-                    encode_batch,
-                    (tokenizer, batch, max_length),
-                )
+    with ThreadPoolExecutor(pool_size) as pool:
+        for i in range(pool_size):
+            file_path = os.path.join(tem_dir, f"{i}.txt")
+            future = pool.submit(
+                run,
+                file_path,
+                batch_size,
+                tokenizer_path,
+                max_length,
+                queue,
             )
-        for future in tqdm(futures):
-            df_rows.extend(future.get())
+            futures.append(future)
+        for future in futures:
+            df_rows.extend(future.result())
     df = pd.DataFrame(df_rows)
     df.to_parquet(output_path, index=False)
 
-    print("### Convert done. Data length:", len(df))
+    tqdm.write(f"### Convert done. Data length: {len(df)}")
+    shutil.rmtree(tem_dir)
 
-    print("### Verifying result...")
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    tqdm.write("### Verifying result...")
     verify_df = df.sample(n=3)
     for index, row in verify_df.iterrows():
         input_ids = row["input_ids"]
         labels = row["labels"]
         text = tokenizer.decode(input_ids, skip_special_tokens=True)
-        print(f"Text: {text}")
-        print(f"Input IDs: {input_ids}")
-        print(f"Labels: {labels}")
-        print("-" * 40)
+        tqdm.write(f"Text: {text}")
+        tqdm.write(f"Input IDs: {input_ids}")
+        tqdm.write(f"Labels: {labels}")
+        tqdm.write("-" * 40)
