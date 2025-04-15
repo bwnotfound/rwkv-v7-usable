@@ -3,6 +3,7 @@
 ########################################################################################################
 
 import os, math, gc, importlib
+import logging
 from dataclasses import dataclass, field
 import torch
 import torch.nn as nn
@@ -33,40 +34,44 @@ if os.environ.get("RWKV_JIT_ON", "0") == "1":
 
 from torch.utils.cpp_extension import load
 
-HEAD_SIZE = int(os.environ["RWKV_HEAD_SIZE"])
 
-CHUNK_LEN = 16
+def load_cpp_extension(head_size, chunk_len):
+    flags = [
+        "-res-usage",
+        f"-D_C_={head_size}",
+        f"-D_CHUNK_LEN_={chunk_len}",
+        "--use_fast_math",
+        "-O3",
+        "-Xptxas -O3",
+        "--extra-device-vectorization",
+    ]
+    load(
+        name="wind_backstepping",
+        sources=[f"cuda/wkv7_cuda.cu", "cuda/wkv7_op.cpp"],
+        is_python_module=False,
+        verbose=True,
+        extra_cuda_cflags=flags,
+    )
 
-flags = [
-    "-res-usage",
-    f"-D_C_={HEAD_SIZE}",
-    f"-D_CHUNK_LEN_={CHUNK_LEN}",
-    "--use_fast_math",
-    "-O3",
-    "-Xptxas -O3",
-    "--extra-device-vectorization",
-]
-load(
-    name="wind_backstepping",
-    sources=[f"cuda/wkv7_cuda.cu", "cuda/wkv7_op.cpp"],
-    is_python_module=False,
-    verbose=True,
-    extra_cuda_cflags=flags,
-)
+
+loaded_head_size = None
 
 
 class WindBackstepping(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, w, q, k, v, z, b):
+    def forward(ctx, w, q, k, v, z, b, meta_tensor):
         B, T, H, C = w.shape
-        assert T % CHUNK_LEN == 0
+        chunk_len = meta_tensor[0]
+        assert (
+            T % chunk_len == 0
+        ), f"input length({T}) must be divisible by chunk_len({chunk_len})"
         assert all(
             i.dtype == torch.bfloat16 for i in [w, q, k, v, z, b]
         ), f"w: {w.dtype}, q: {q.dtype}, k: {k.dtype}, v: {v.dtype}, z: {z.dtype}, b: {b.dtype}"
         assert all(i.is_contiguous() for i in [w, q, k, v, z, b])
         y = torch.empty_like(v)
         s = torch.empty(
-            B, H, T // CHUNK_LEN, C, C, dtype=torch.float32, device=w.device
+            B, H, T // chunk_len, C, C, dtype=torch.float32, device=w.device
         )
         sa = torch.empty(B, T, H, C, dtype=torch.float32, device=w.device)
         torch.ops.wind_backstepping.forward(w, q, k, v, z, b, y, s, sa)
@@ -82,17 +87,19 @@ class WindBackstepping(torch.autograd.Function):
         torch.ops.wind_backstepping.backward(
             w, q, k, v, z, b, dy, s, sa, dw, dq, dk, dv, dz, db
         )
-        return dw, dq, dk, dv, dz, db
+        return dw, dq, dk, dv, dz, db, None
 
 
-def RUN_CUDA_RWKV7g(q, w, k, v, a, b):
+def RUN_CUDA_RWKV7g(q, w, k, v, a, b, meta_tensor):
     B, T, HC = q.shape
-    CHUNK_LEN = 16
+    chunk_len, head_size = meta_tensor[0], meta_tensor[1]
     assert (
-        T % CHUNK_LEN == 0
-    ), f"input length({T}) must be divisible by CHUNK_LEN({CHUNK_LEN})"
-    q, w, k, v, a, b = [i.view(B, T, HC // 64, 64) for i in [q, w, k, v, a, b]]
-    return WindBackstepping.apply(w, q, k, v, a, b).view(B, T, HC)
+        T % chunk_len == 0
+    ), f"input length({T}) must be divisible by chunk_len({chunk_len.item()})"
+    q, w, k, v, a, b = [
+        i.view(B, T, HC // head_size, head_size) for i in [q, w, k, v, a, b]
+    ]
+    return WindBackstepping.apply(w, q, k, v, a, b, meta_tensor).view(B, T, HC)
 
 
 ########################################################################################################
@@ -111,6 +118,8 @@ class RWKVConfig(PretrainedConfig):
         dim_ffn=None,
         vocab_size=0,
         max_length=1024,
+        chunk_len=16,
+        torch_dtype="bf16",
         gradient_checkpointing=True,
         **kwargs,
     ):
@@ -118,12 +127,17 @@ class RWKVConfig(PretrainedConfig):
         self.hidden_size = hidden_size
         self.n_layer = n_layer
         self.head_size = head_size
+        assert (
+            hidden_size % head_size == 0
+        ), "hidden_size must be divisible by head_size"
         if dim_ffn is None:
             dim_ffn = int((hidden_size * 3.5) // 32 * 32)
         self.dim_ffn = dim_ffn
         self.vocab_size = vocab_size
         self.max_length = max_length
         self.gradient_checkpointing = gradient_checkpointing
+        self.chunk_len = chunk_len
+        self.torch_dtype = torch_dtype
 
 
 @dataclass
@@ -141,6 +155,11 @@ class OptimConfig:
 
     def __post_init__(self):
         self.betas = (self.beta1, self.beta2)
+
+
+class RWKVCache:
+    def __init__(self):
+        pass
 
 
 class RWKV_Tmix_x070(MyModule):
@@ -236,7 +255,7 @@ class RWKV_Tmix_x070(MyModule):
             self.output.weight.data.zero_()
 
     @MyFunction
-    def forward(self, x, v_first):
+    def forward_script_part1(self, x, v_first):
         B, T, C = x.size()
         H = self.n_head
         xx = self.time_shift(x) - x
@@ -269,7 +288,12 @@ class RWKV_Tmix_x070(MyModule):
         kk = F.normalize(kk.view(B, T, H, -1), dim=-1, p=2.0).view(B, T, C)
         k = k * (1 + (a - 1) * self.k_a)
 
-        x = RUN_CUDA_RWKV7g(r, w, k, v, -kk, kk * a)
+        return r, w, k, v, -kk, kk * a, g, v_first
+
+    @MyFunction
+    def forward_script_part2(self, x, r, k, v, g):
+        B, T, C = x.size()
+        H = self.n_head
         x = self.ln_x(x.view(B * T, C)).view(B, T, C)
 
         x = x + (
@@ -279,6 +303,12 @@ class RWKV_Tmix_x070(MyModule):
             * v.view(B, T, H, -1)
         ).view(B, T, C)
         x = self.output(x * g)
+        return x
+
+    def forward(self, x, v_first, meta_tensor, cache: RWKVCache = None):
+        r, w, k, v, _kk, _kka, g, v_first = self.forward_script_part1(x, v_first)
+        x = RUN_CUDA_RWKV7g(r, w, k, v, _kk, _kka, meta_tensor)
+        x = self.forward_script_part2(x, r, k, v, g)
         return x, v_first
 
 
@@ -337,11 +367,11 @@ class Block(nn.Module):
         self.att = RWKV_Tmix_x070(config, layer_id)
         self.ffn = RWKV_CMix_x070(config, layer_id)
 
-    def forward(self, x, v_first):
+    def forward(self, x, v_first, meta_tensor):
         if self.layer_id == 0:
             x = self.ln0(x)
 
-        x_attn, v_first = self.att(self.ln1(x), v_first)
+        x_attn, v_first = self.att(self.ln1(x), v_first, meta_tensor)
         x = x + x_attn
 
         x = x + self.ffn(self.ln2(x))
@@ -385,6 +415,21 @@ class RWKV(L.LightningModule):
         self.ln_out = nn.LayerNorm(config.hidden_size)
         self.head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.print_params_info = print_params_info
+
+        self.meta_tensor = torch.tensor(
+            [self.config.chunk_len, self.config.head_size],
+            dtype=torch.long,
+            device="cpu",
+        )
+
+        global loaded_head_size
+        if loaded_head_size != config.head_size:
+            if loaded_head_size is not None:
+                logging.warning(
+                    f"head_size changed from {loaded_head_size} to {config.head_size}, reloading cpp extension."
+                )
+            load_cpp_extension(config.head_size, config.chunk_len)
+            loaded_head_size = config.head_size
 
     def configure_optimizers(self):
         config = self.optim_config
@@ -501,7 +546,7 @@ class RWKV(L.LightningModule):
             if config.gradient_checkpointing:
                 x, v_first = deepspeed.checkpointing.checkpoint(block, x, v_first)
             else:
-                x, v_first = block(x, v_first)
+                x, v_first = block(x, v_first, self.meta_tensor)
 
         x = self.ln_out(x)
         x = self.head(x)
@@ -620,9 +665,9 @@ class RWKV(L.LightningModule):
                     nn.init.orthogonal_(m[n], gain=scale)
 
             m[n] = m[n].cpu()
-            if os.environ["RWKV_FLOAT_MODE"] == "fp16":
+            if self.config.torch_dtype == "fp16":
                 m[n] = m[n].half()
-            elif os.environ["RWKV_FLOAT_MODE"] == "bf16":
+            elif self.config.torch_dtype == "bf16":
                 m[n] = m[n].bfloat16()
             n_params += m[n].numel()
         if log:

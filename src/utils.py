@@ -57,7 +57,7 @@ def load_checkpoint(
     if not os.path.exists(checkpoint_dir):
         raise RuntimeError(f"Directory {checkpoint_dir} does not exist.")
     state_dict = torch.load(
-        os.path.join(checkpoint_dir, "model.pth"), map_location="cpu"
+        os.path.join(checkpoint_dir, "model.pth"), map_location="cpu", weights_only=True
     )
     if dtype is not None:
         for key in state_dict.keys():

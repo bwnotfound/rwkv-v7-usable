@@ -1,7 +1,6 @@
 import os
 
-os.environ["RWKV_HEAD_SIZE"] = "64"
-os.environ["RWKV_FLOAT_MODE"] = "bf16"
+os.environ["RWKV_JIT_ON"] = "1"
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 from threading import Event
 
@@ -232,11 +231,10 @@ if __name__ == "__main__":
     assert isinstance(config, RWKVConfig)
     config.gradient_checkpointing = False
     model = RWKV(config, print_params_info=False)
-    model.from_state_dict(model.generate_init_weight("gpu"))
+    # model.from_state_dict(model.generate_init_weight("gpu"))
     model.to(torch.bfloat16)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     load_checkpoint(ckpt_path, model, dtype=torch.bfloat16)
-    model.to(torch.bfloat16)
     model.cuda()
 
     app = main()

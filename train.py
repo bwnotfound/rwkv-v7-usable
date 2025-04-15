@@ -80,6 +80,7 @@ class ScriptArguments:
     gradient_clip_algorithm: str = field(default=None)
     step_offset: int = field(default=0)
     print_params_info: bool = field(default=True)
+    jit_on: bool = field(default=False)
 
 
 if __name__ == "__main__":
@@ -163,10 +164,8 @@ if __name__ == "__main__":
         rank_zero_info(
             "\n\nNote: you are using fp16 (might overflow). Try bf16 / tf32 for stable training.\n\n"
         )
-
-    os.environ["RWKV_JIT_ON"] = "1"
-    if "deepspeed_stage_3" in args.strategy:
-        os.environ["RWKV_JIT_ON"] = "0"  # somehow incompatible
+    if args.jit_on and not "deepspeed_stage_3" in args.strategy:
+        os.environ["RWKV_JIT_ON"] = "1"
 
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.enabled = True
