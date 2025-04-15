@@ -59,7 +59,7 @@ loaded_head_size = None
 
 class WindBackstepping(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, w, q, k, v, z, b, meta_tensor):
+    def forward(ctx, w, q, k, v, z, b, init_state, meta_tensor):
         B, T, H, C = w.shape
         chunk_len = meta_tensor[0]
         assert (
@@ -72,25 +72,26 @@ class WindBackstepping(torch.autograd.Function):
         y = torch.empty_like(v)
         s = torch.empty(
             B, H, T // chunk_len, C, C, dtype=torch.float32, device=w.device
-        )
+        )   # s == wkv_T
+        # init_state shape: (B, H, C, C)
         sa = torch.empty(B, T, H, C, dtype=torch.float32, device=w.device)
-        torch.ops.wind_backstepping.forward(w, q, k, v, z, b, y, s, sa)
-        ctx.save_for_backward(w, q, k, v, z, b, s, sa)
-        return y
+        torch.ops.wind_backstepping.forward(w, q, k, v, z, b, y, s, sa, init_state)
+        ctx.save_for_backward(w, q, k, v, z, b, s, sa, init_state)
+        return y, s[:,:,-1]
 
     @staticmethod
-    def backward(ctx, dy):
+    def backward(ctx, dy, last_state):
         assert all(i.dtype == torch.bfloat16 for i in [dy]), f"dy: {dy.dtype}"
         assert all(i.is_contiguous() for i in [dy])
-        w, q, k, v, z, b, s, sa = ctx.saved_tensors
-        dw, dq, dk, dv, dz, db = [torch.empty_like(x) for x in [w, q, k, v, z, b]]
+        w, q, k, v, z, b, s, sa, init_state = ctx.saved_tensors
+        dw, dq, dk, dv, dz, db, dinit_state = [torch.empty_like(x) for x in [w, q, k, v, z, b, init_state]]
         torch.ops.wind_backstepping.backward(
-            w, q, k, v, z, b, dy, s, sa, dw, dq, dk, dv, dz, db
+            w, q, k, v, z, b, dy, s, sa, dw, dq, dk, dv, dz, db, dinit_state
         )
-        return dw, dq, dk, dv, dz, db, None
+        return dw, dq, dk, dv, dz, db, dinit_state, None
 
 
-def RUN_CUDA_RWKV7g(q, w, k, v, a, b, meta_tensor):
+def RUN_CUDA_RWKV7g(q, w, k, v, a, b, init_state, meta_tensor):
     B, T, HC = q.shape
     chunk_len, head_size = meta_tensor[0], meta_tensor[1]
     assert (
@@ -99,7 +100,8 @@ def RUN_CUDA_RWKV7g(q, w, k, v, a, b, meta_tensor):
     q, w, k, v, a, b = [
         i.view(B, T, HC // head_size, head_size) for i in [q, w, k, v, a, b]
     ]
-    return WindBackstepping.apply(w, q, k, v, a, b, meta_tensor).view(B, T, HC)
+    result = WindBackstepping.apply(w, q, k, v, a, b, init_state, meta_tensor)
+    return result[0].view(B, T, HC), result[1]  # result[1] shape: (B, H, C, C)
 
 
 ########################################################################################################
@@ -163,10 +165,10 @@ class RWKVCache:
 
 
 class RWKV_Tmix_x070(MyModule):
-    def __init__(self, config: RWKVConfig, layer_id):
+    def __init__(self, config: RWKVConfig, layer_idx):
         super().__init__()
         self.config = config
-        self.layer_id = layer_id
+        self.layer_idx = layer_idx
 
         self.head_size = config.head_size
         self.n_head = config.hidden_size // self.head_size
@@ -176,8 +178,8 @@ class RWKV_Tmix_x070(MyModule):
         C = config.hidden_size
 
         with torch.no_grad():
-            ratio_0_to_1 = layer_id / (config.n_layer - 1)  # 0 to 1
-            ratio_1_to_almost0 = 1.0 - (layer_id / config.n_layer)  # 1 to ~0
+            ratio_0_to_1 = layer_idx / (config.n_layer - 1)  # 0 to 1
+            ratio_1_to_almost0 = 1.0 - (layer_idx / config.n_layer)  # 1 to ~0
             ddd = torch.ones(1, 1, C)
             for i in range(C):
                 ddd[0, 0, i] = i / C
@@ -273,7 +275,7 @@ class RWKV_Tmix_x070(MyModule):
         )  # soft-clamp to (-inf, -0.5)
         k = self.key(xk)
         v = self.value(xv)
-        if self.layer_id == 0:
+        if self.layer_idx == 0:
             v_first = v  # store the v of the first layer
         else:
             v = v + (v_first - v) * torch.sigmoid(
@@ -305,9 +307,64 @@ class RWKV_Tmix_x070(MyModule):
         x = self.output(x * g)
         return x
 
+    def rwkv_forward_pytorch(self, w, q, k, v, a, b, chunk_len):
+        """
+        纯 PyTorch 实现的 forward 操作，其计算流程与 CUDA 版本一致。
+
+        输入张量的形状均为 (B, T, H, C)，其中：
+        w, q, k, v, a, b 均为 torch.bfloat16 类型
+        输出：
+        y    : (B, T, H, C) ，同样以 bfloat16 存储，实际上每个时间步输出是一个标量（复制到每个通道）
+        s_out: (B, H, T//chunk_len, C, C) ，在每个 chunk 的末尾保存状态快照（每行都相同）
+        sa_out: (B, T, H, C) ，每个时间步保存的 sa（标量复制到所有通道）
+        """
+        B, T, H, C = w.shape
+        device = w.device
+
+        # 初始化输出张量
+        y = torch.empty((B, T, H, C), dtype=torch.bfloat16, device=device)
+        sa_out = torch.empty((B, T, H, C), dtype=torch.float32, device=device)
+
+        state = torch.zeros(B, H, C, dtype=torch.float32, device=device)
+        for t_idx in range(T):
+            # 将当前时间步的各个向量转换为 float32，并做必要的变换：
+            # 对 w 进行: exp(-exp(w))
+            q_vec = q[:, t_idx].float()       # shape: (C,)
+            w_vec = torch.exp(-torch.exp(w[:, t_idx].float()))
+            k_vec = k[:, t_idx].float()
+            a_vec = a[:, t_idx].float()
+            b_vec = b[:, t_idx].float()
+            
+            # 计算 sa = a · state（标量）
+            sa_scalar = (a_vec * state).sum()
+            # 将 sa 标量复制到长度为 C 的向量存储到 sa_out 中
+            sa_out[:, t_idx].fill_(sa_scalar.item())
+            
+            # 取出 v 对应的向量（float32）
+            v_vec = v[:, t_idx].float()
+            
+            # 更新状态向量：逐元素更新
+            state = state * w_vec + sa_scalar * b_vec + k_vec * v_vec
+            
+            # 计算 y = q · state（标量），并复制到输出向量的每个元素
+            y_scalar = (q_vec * state).sum()
+            y[:, t_idx].fill_(y_scalar.item())
+            
+
+
+        return y, sa_out
+
+    def step_forward(self, x, v_first, meta_tensor, cache: RWKVCache = None):
+        pass
+
     def forward(self, x, v_first, meta_tensor, cache: RWKVCache = None):
+        B, T, C = x.size()
+        H = self.n_head
         r, w, k, v, _kk, _kka, g, v_first = self.forward_script_part1(x, v_first)
-        x = RUN_CUDA_RWKV7g(r, w, k, v, _kk, _kka, meta_tensor)
+        init_state = torch.zeros(
+            B, H, C, C, dtype=torch.float32, device=w.device
+        )   # 视作wkv_T
+        x, last_state = RUN_CUDA_RWKV7g(r, w, k, v, _kk, _kka, init_state, meta_tensor)
         x = self.forward_script_part2(x, r, k, v, g)
         return x, v_first
 
@@ -316,14 +373,14 @@ class RWKV_Tmix_x070(MyModule):
 
 
 class RWKV_CMix_x070(MyModule):
-    def __init__(self, config: RWKVConfig, layer_id):
+    def __init__(self, config: RWKVConfig, layer_idx):
         super().__init__()
         self.config = config
-        self.layer_id = layer_id
+        self.layer_idx = layer_idx
         self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
 
         with torch.no_grad():
-            ratio_1_to_almost0 = 1.0 - (layer_id / config.n_layer)  # 1 to ~0
+            ratio_1_to_almost0 = 1.0 - (layer_idx / config.n_layer)  # 1 to ~0
             ddd = torch.ones(1, 1, config.hidden_size)
             for i in range(config.hidden_size):
                 ddd[0, 0, i] = i / config.hidden_size
@@ -353,22 +410,22 @@ class RWKV_CMix_x070(MyModule):
 
 
 class Block(nn.Module):
-    def __init__(self, config: RWKVConfig, layer_id):
+    def __init__(self, config: RWKVConfig, layer_idx):
         super().__init__()
         self.config = config
-        self.layer_id = layer_id
+        self.layer_idx = layer_idx
 
         self.ln1 = nn.LayerNorm(config.hidden_size)
         self.ln2 = nn.LayerNorm(config.hidden_size)
 
-        if self.layer_id == 0:
+        if self.layer_idx == 0:
             self.ln0 = nn.LayerNorm(config.hidden_size)
 
-        self.att = RWKV_Tmix_x070(config, layer_id)
-        self.ffn = RWKV_CMix_x070(config, layer_id)
+        self.att = RWKV_Tmix_x070(config, layer_idx)
+        self.ffn = RWKV_CMix_x070(config, layer_idx)
 
     def forward(self, x, v_first, meta_tensor):
-        if self.layer_id == 0:
+        if self.layer_idx == 0:
             x = self.ln0(x)
 
         x_attn, v_first = self.att(self.ln1(x), v_first, meta_tensor)

@@ -43,7 +43,7 @@ save_limits=2
 enable_checkpointing=false # TODO: Trainer params. This function is overrided by gradient_checkpointing, please set false
 gradient_clip_val=1.0
 print_params_info=false 
-jit_on=false # please set false for train task because jit mode consume more time in backward.
+jit_on=false # please set false for train task because jit mode consume more time in backward. train.py force jit_on = false because jit will affect the grad calc. We should only use jit on inference.
 
 N_NODE=1       # number of nodes
 GPU_PER_NODE=1 # number of GPUs per node
