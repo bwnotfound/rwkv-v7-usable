@@ -1,7 +1,7 @@
 import json
 import os
 import multiprocessing
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from threading import Thread
 import shutil
 import gc
@@ -150,7 +150,7 @@ if __name__ == "__main__":
 
     df_rows = []
     futures = []
-    with ThreadPoolExecutor(pool_size) as pool:
+    with ProcessPoolExecutor(pool_size) as pool:
         for i in range(pool_size):
             file_path = os.path.join(tem_dir, f"{i}.txt")
             future = pool.submit(

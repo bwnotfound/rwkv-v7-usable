@@ -72,19 +72,21 @@ class WindBackstepping(torch.autograd.Function):
         y = torch.empty_like(v)
         s = torch.empty(
             B, H, T // chunk_len, C, C, dtype=torch.float32, device=w.device
-        )   # s == wkv_T
+        )  # s == wkv_T
         # init_state shape: (B, H, C, C)
         sa = torch.empty(B, T, H, C, dtype=torch.float32, device=w.device)
         torch.ops.wind_backstepping.forward(w, q, k, v, z, b, y, s, sa, init_state)
         ctx.save_for_backward(w, q, k, v, z, b, s, sa, init_state)
-        return y, s[:,:,-1]
+        return y, s[:, :, -1]
 
     @staticmethod
     def backward(ctx, dy, last_state):
         assert all(i.dtype == torch.bfloat16 for i in [dy]), f"dy: {dy.dtype}"
         assert all(i.is_contiguous() for i in [dy])
         w, q, k, v, z, b, s, sa, init_state = ctx.saved_tensors
-        dw, dq, dk, dv, dz, db, dinit_state = [torch.empty_like(x) for x in [w, q, k, v, z, b, init_state]]
+        dw, dq, dk, dv, dz, db, dinit_state = [
+            torch.empty_like(x) for x in [w, q, k, v, z, b, init_state]
+        ]
         torch.ops.wind_backstepping.backward(
             w, q, k, v, z, b, dy, s, sa, dw, dq, dk, dv, dz, db, dinit_state
         )
@@ -161,7 +163,30 @@ class OptimConfig:
 
 class RWKVCache:
     def __init__(self):
-        pass
+        self.cache_states = []
+        self.cache_x = []
+        self.cache_x_mlp = []
+
+    def get(self, layer_idx):
+        result = []
+        for item in [self.cache_states, self.cache_x, self.cache_x_mlp]:
+            if layer_idx >= len(item):
+                result.append(None)
+            else:
+                result.append(item[layer_idx])
+
+        return result
+
+    def update(self, layer_idx, state=None, x=None, x_mlp=None):
+        for item, cache_item in zip(
+            [state, x, x_mlp], [self.cache_states, self.cache_x, self.cache_x_mlp]
+        ):
+            if item is None:
+                continue
+            if layer_idx >= len(cache_item):
+                cache_item.append(item)
+            else:
+                cache_item[layer_idx] = item
 
 
 class RWKV_Tmix_x070(MyModule):
@@ -257,10 +282,15 @@ class RWKV_Tmix_x070(MyModule):
             self.output.weight.data.zero_()
 
     @MyFunction
-    def forward_script_part1(self, x, v_first):
+    def forward_script_part1(self, x, v_first, last_x):
         B, T, C = x.size()
         H = self.n_head
-        xx = self.time_shift(x) - x
+        if last_x is None:
+            xx = self.time_shift(x) - x
+        else:
+            _x = torch.cat([last_x, x], dim=1)
+            xx = self.time_shift(_x) - _x
+            xx = xx[:, 1:, :]
 
         xr = x + xx * self.x_r
         xw = x + xx * self.x_w
@@ -329,28 +359,26 @@ class RWKV_Tmix_x070(MyModule):
         for t_idx in range(T):
             # 将当前时间步的各个向量转换为 float32，并做必要的变换：
             # 对 w 进行: exp(-exp(w))
-            q_vec = q[:, t_idx].float()       # shape: (C,)
+            q_vec = q[:, t_idx].float()  # shape: (C,)
             w_vec = torch.exp(-torch.exp(w[:, t_idx].float()))
             k_vec = k[:, t_idx].float()
             a_vec = a[:, t_idx].float()
             b_vec = b[:, t_idx].float()
-            
+
             # 计算 sa = a · state（标量）
             sa_scalar = (a_vec * state).sum()
             # 将 sa 标量复制到长度为 C 的向量存储到 sa_out 中
             sa_out[:, t_idx].fill_(sa_scalar.item())
-            
+
             # 取出 v 对应的向量（float32）
             v_vec = v[:, t_idx].float()
-            
+
             # 更新状态向量：逐元素更新
             state = state * w_vec + sa_scalar * b_vec + k_vec * v_vec
-            
+
             # 计算 y = q · state（标量），并复制到输出向量的每个元素
             y_scalar = (q_vec * state).sum()
             y[:, t_idx].fill_(y_scalar.item())
-            
-
 
         return y, sa_out
 
@@ -360,11 +388,23 @@ class RWKV_Tmix_x070(MyModule):
     def forward(self, x, v_first, meta_tensor, cache: RWKVCache = None):
         B, T, C = x.size()
         H = self.n_head
-        r, w, k, v, _kk, _kka, g, v_first = self.forward_script_part1(x, v_first)
-        init_state = torch.zeros(
-            B, H, C, C, dtype=torch.float32, device=w.device
-        )   # 视作wkv_T
+        cache_state, last_x, _ = (
+            cache.get(self.layer_idx) if cache else (None, None, None)
+        )
+        if cache_state is None:
+            init_state = torch.zeros(
+                B, H, C, C, dtype=torch.float32, device=x.device
+            )  # 视作wkv_T
+        else:
+            init_state = cache_state
+
+        cache_x = x
+        r, w, k, v, _kk, _kka, g, v_first = self.forward_script_part1(
+            x, v_first, last_x
+        )
         x, last_state = RUN_CUDA_RWKV7g(r, w, k, v, _kk, _kka, init_state, meta_tensor)
+        if cache is not None:
+            cache.update(self.layer_idx, last_state, cache_x[:, -1:, :])
         x = self.forward_script_part2(x, r, k, v, g)
         return x, v_first
 
@@ -395,8 +435,19 @@ class RWKV_CMix_x070(MyModule):
         self.value.weight.data.zero_()
 
     @MyFunction
-    def forward(self, x):
-        xx = self.time_shift(x) - x
+    def forward(self, x, cache: RWKVCache = None):
+        if cache is None:
+            x_mlp = None
+        else:
+            _, _, x_mlp = cache.get(self.layer_idx)
+        if x_mlp is None:
+            xx = self.time_shift(x) - x
+        else:
+            _x = torch.cat([x_mlp, x], dim=1)
+            xx = self.time_shift(_x) - _x
+            xx = xx[:, 1:, :]
+        if cache is not None:
+            cache.update(self.layer_idx, None, None, x[:, -1:, :])
 
         k = x + xx * self.x_k
         k = torch.relu(self.key(k)) ** 2
@@ -424,14 +475,14 @@ class Block(nn.Module):
         self.att = RWKV_Tmix_x070(config, layer_idx)
         self.ffn = RWKV_CMix_x070(config, layer_idx)
 
-    def forward(self, x, v_first, meta_tensor):
+    def forward(self, x, v_first, meta_tensor, cache: RWKVCache = None):
         if self.layer_idx == 0:
             x = self.ln0(x)
 
-        x_attn, v_first = self.att(self.ln1(x), v_first, meta_tensor)
+        x_attn, v_first = self.att(self.ln1(x), v_first, meta_tensor, cache=cache)
         x = x + x_attn
 
-        x = x + self.ffn(self.ln2(x))
+        x = x + self.ffn(self.ln2(x), cache=cache)
         return x, v_first
 
 
@@ -589,7 +640,7 @@ class RWKV(L.LightningModule):
             return cfg.get("offload_optimizer") or cfg.get("offload_param")
         return False
 
-    def forward(self, idx):
+    def forward(self, idx, cache: RWKVCache = None):
         config = self.config
         B, T = idx.size()
         assert (
@@ -601,9 +652,11 @@ class RWKV(L.LightningModule):
         v_first = torch.empty_like(x)
         for block in self.blocks:
             if config.gradient_checkpointing:
-                x, v_first = deepspeed.checkpointing.checkpoint(block, x, v_first)
+                x, v_first = deepspeed.checkpointing.checkpoint(
+                    block, x, v_first, cache=cache
+                )
             else:
-                x, v_first = block(x, v_first, self.meta_tensor)
+                x, v_first = block(x, v_first, self.meta_tensor, cache=cache)
 
         x = self.ln_out(x)
         x = self.head(x)
