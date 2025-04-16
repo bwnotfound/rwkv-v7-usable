@@ -72,7 +72,7 @@ class WindBackstepping(torch.autograd.Function):
         y = torch.empty_like(v)
         s = torch.empty(
             B, H, T // chunk_len, C, C, dtype=torch.float32, device=w.device
-        )  # s == wkv_T
+        )
         # init_state shape: (B, H, C, C)
         sa = torch.empty(B, T, H, C, dtype=torch.float32, device=w.device)
         torch.ops.wind_backstepping.forward(w, q, k, v, z, b, y, s, sa, init_state)
@@ -337,57 +337,42 @@ class RWKV_Tmix_x070(MyModule):
         x = self.output(x * g)
         return x
 
-    def rwkv_forward_pytorch(self, w, q, k, v, a, b, chunk_len):
-        """
-        纯 PyTorch 实现的 forward 操作，其计算流程与 CUDA 版本一致。
+    def rwkv_forward_pytorch(self, r, w, k, v, neg_kk, kk_plus_a, init_state):
+        B, T, _ = w.shape
+        H, C = self.n_head, self.head_size
+        dtype = w.dtype
 
-        输入张量的形状均为 (B, T, H, C)，其中：
-        w, q, k, v, a, b 均为 torch.bfloat16 类型
-        输出：
-        y    : (B, T, H, C) ，同样以 bfloat16 存储，实际上每个时间步输出是一个标量（复制到每个通道）
-        s_out: (B, H, T//chunk_len, C, C) ，在每个 chunk 的末尾保存状态快照（每行都相同）
-        sa_out: (B, T, H, C) ，每个时间步保存的 sa（标量复制到所有通道）
-        """
-        B, T, H, C = w.shape
-        device = w.device
+        neg_kk = neg_kk.view(B, T, H, C, 1).float()
+        kk_plus_a = kk_plus_a.view(B, T, H, 1, C).float()
+        m_all = neg_kk @ kk_plus_a
 
-        # 初始化输出张量
-        y = torch.empty((B, T, H, C), dtype=torch.bfloat16, device=device)
-        sa_out = torch.empty((B, T, H, C), dtype=torch.float32, device=device)
+        r = r.view(B, T, H, C).float()
+        w = w.view(B, T, H, C).float()
+        k = k.view(B, T, H, 1, C).float()
+        v = v.view(B, T, H, C, 1).float()
 
-        state = torch.zeros(B, H, C, dtype=torch.float32, device=device)
-        for t_idx in range(T):
-            # 将当前时间步的各个向量转换为 float32，并做必要的变换：
-            # 对 w 进行: exp(-exp(w))
-            q_vec = q[:, t_idx].float()  # shape: (C,)
-            w_vec = torch.exp(-torch.exp(w[:, t_idx].float()))
-            k_vec = k[:, t_idx].float()
-            a_vec = a[:, t_idx].float()
-            b_vec = b[:, t_idx].float()
+        y = []
+        state = init_state
 
-            # 计算 sa = a · state（标量）
-            sa_scalar = (a_vec * state).sum()
-            # 将 sa 标量复制到长度为 C 的向量存储到 sa_out 中
-            sa_out[:, t_idx].fill_(sa_scalar.item())
+        for t in range(T):
+            w_vec = torch.exp(-torch.exp(-w[:, t]))
+            m_vec = m_all[:, t]
 
-            # 取出 v 对应的向量（float32）
-            v_vec = v[:, t_idx].float()
+            state = (
+                torch.einsum("bhij,bhj->bhij", state, w_vec)
+                + torch.einsum("bhij,bhjk->bhik", state, m_vec)
+                + v[:, t] @ k[:, t]
+            )
 
-            # 更新状态向量：逐元素更新
-            state = state * w_vec + sa_scalar * b_vec + k_vec * v_vec
+            y_t = torch.einsum("bhi,bhij->bhj", r[:, t], state)
+            y.append(y_t)
 
-            # 计算 y = q · state（标量），并复制到输出向量的每个元素
-            y_scalar = (q_vec * state).sum()
-            y[:, t_idx].fill_(y_scalar.item())
-
-        return y, sa_out
-
-    def step_forward(self, x, v_first, meta_tensor, cache: RWKVCache = None):
-        pass
+        y = torch.stack(y, dim=1).to(dtype)
+        return y.view(B, T, -1), state
 
     def forward(self, x, v_first, meta_tensor, cache: RWKVCache = None):
-        B, T, C = x.size()
-        H = self.n_head
+        B, T, _ = x.size()
+        H, C = self.n_head, self.head_size
         cache_state, last_x, _ = (
             cache.get(self.layer_idx) if cache else (None, None, None)
         )
@@ -399,10 +384,15 @@ class RWKV_Tmix_x070(MyModule):
             init_state = cache_state
 
         cache_x = x
-        r, w, k, v, _kk, _kka, g, v_first = self.forward_script_part1(
+        r, w, k, v, neg_kk, kk_plus_a, g, v_first = self.forward_script_part1(
             x, v_first, last_x
         )
-        x, last_state = RUN_CUDA_RWKV7g(r, w, k, v, _kk, _kka, init_state, meta_tensor)
+        # x, last_state = RUN_CUDA_RWKV7g(
+        #     r, w, k, v, neg_kk, kk_plus_a, init_state, meta_tensor
+        # )
+        x, last_state = self.rwkv_forward_pytorch(
+            r, w, k, v, neg_kk, kk_plus_a, init_state
+        )
         if cache is not None:
             cache.update(self.layer_idx, last_state, cache_x[:, -1:, :])
         x = self.forward_script_part2(x, r, k, v, g)

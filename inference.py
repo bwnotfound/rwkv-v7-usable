@@ -1,6 +1,6 @@
 import os
 
-os.environ["RWKV_JIT_ON"] = "1"
+# os.environ["RWKV_JIT_ON"] = "1"
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 from threading import Event
 
@@ -8,7 +8,7 @@ import torch
 import gradio as gr
 from transformers import AutoTokenizer
 
-from src.model import RWKV, RWKVConfig
+from src.model import RWKV, RWKVConfig, RWKVCache
 from src.utils import load_checkpoint
 
 stop_event = Event()
@@ -227,15 +227,18 @@ if __name__ == "__main__":
     ckpt_path = "output/RWKV-v7-L12-D768/sft-checkpoint-75000"
     tokenizer_path = "models/tokenizer"
 
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+
     config = RWKVConfig.from_pretrained(ckpt_path)
     assert isinstance(config, RWKVConfig)
     config.gradient_checkpointing = False
+    config.max_length = 1e10
     model = RWKV(config, print_params_info=False)
     # model.from_state_dict(model.generate_init_weight("gpu"))
     model.to(torch.bfloat16)
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     load_checkpoint(ckpt_path, model, dtype=torch.bfloat16)
     model.cuda()
+    model.eval()
 
     app = main()
     app.launch()
