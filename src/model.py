@@ -166,6 +166,7 @@ class RWKVCache:
         self.cache_states = []
         self.cache_x = []
         self.cache_x_mlp = []
+        self.seq_length = []
 
     def get(self, layer_idx):
         result = []
@@ -177,7 +178,7 @@ class RWKVCache:
 
         return result
 
-    def update(self, layer_idx, state=None, x=None, x_mlp=None):
+    def update(self, layer_idx, state=None, x=None, x_mlp=None, length=None):
         for item, cache_item in zip(
             [state, x, x_mlp], [self.cache_states, self.cache_x, self.cache_x_mlp]
         ):
@@ -187,6 +188,16 @@ class RWKVCache:
                 cache_item.append(item)
             else:
                 cache_item[layer_idx] = item
+        if length is not None:
+            if layer_idx >= len(self.seq_length):
+                self.seq_length.append(length)
+            else:
+                self.seq_length[layer_idx] += length
+
+    def get_seq_length(self, layer_idx=0):
+        if layer_idx >= len(self.seq_length):
+            return 0
+        return self.seq_length[layer_idx]
 
 
 class RWKV_Tmix_x070(MyModule):
@@ -338,6 +349,7 @@ class RWKV_Tmix_x070(MyModule):
         return x
 
     def rwkv_forward_pytorch(self, r, w, k, v, neg_kk, kk_plus_a, init_state):
+        # original cuda version init_state == wkv_T. Therefore a T transpose is needed for init_state
         B, T, _ = w.shape
         H, C = self.n_head, self.head_size
         dtype = w.dtype
@@ -352,23 +364,24 @@ class RWKV_Tmix_x070(MyModule):
         v = v.view(B, T, H, C, 1).float()
 
         y = []
-        state = init_state
+        state = init_state.transpose(-1, -2)
 
         for t in range(T):
-            w_vec = torch.exp(-torch.exp(-w[:, t]))
+            w_vec = torch.exp(-torch.exp(w[:, t]))
             m_vec = m_all[:, t]
 
             state = (
                 torch.einsum("bhij,bhj->bhij", state, w_vec)
-                + torch.einsum("bhij,bhjk->bhik", state, m_vec)
+                + state @ m_vec
                 + v[:, t] @ k[:, t]
             )
 
-            y_t = torch.einsum("bhi,bhij->bhj", r[:, t], state)
+            y_t = torch.einsum("bhi, bhji->bhj", r[:, t], state)
+            # y_t = (r[:, t].unsqueeze(-2) @ state.transpose(-1,-2)).squeeze(-2)    # This version is quicker when numel is big enough.
             y.append(y_t)
 
         y = torch.stack(y, dim=1).to(dtype)
-        return y.view(B, T, -1), state
+        return y.view(B, T, -1), state.transpose(-1, -2)
 
     def forward(self, x, v_first, meta_tensor, cache: RWKVCache = None):
         B, T, _ = x.size()
@@ -387,12 +400,36 @@ class RWKV_Tmix_x070(MyModule):
         r, w, k, v, neg_kk, kk_plus_a, g, v_first = self.forward_script_part1(
             x, v_first, last_x
         )
+        if T // self.config.chunk_len >= 1:
+            batch_num = T // self.config.chunk_len * self.config.chunk_len
+            x, last_state = RUN_CUDA_RWKV7g(
+                r[:, :batch_num],
+                w[:, :batch_num],
+                k[:, :batch_num],
+                v[:, :batch_num],
+                neg_kk[:, :batch_num],
+                kk_plus_a[:, :batch_num],
+                init_state,
+                meta_tensor,
+            )
+            if T % self.config.chunk_len > 0:
+                x_naive, last_state = self.rwkv_forward_pytorch(
+                    r[:, batch_num:],
+                    w[:, batch_num:],
+                    k[:, batch_num:],
+                    v[:, batch_num:],
+                    neg_kk[:, batch_num:],
+                    kk_plus_a[:, batch_num:],
+                    last_state,
+                )
+                x = torch.cat([x, x_naive], dim=1)
         # x, last_state = RUN_CUDA_RWKV7g(
         #     r, w, k, v, neg_kk, kk_plus_a, init_state, meta_tensor
         # )
-        x, last_state = self.rwkv_forward_pytorch(
-            r, w, k, v, neg_kk, kk_plus_a, init_state
-        )
+        else:
+            x, last_state = self.rwkv_forward_pytorch(
+                r, w, k, v, neg_kk, kk_plus_a, init_state
+            )
         if cache is not None:
             cache.update(self.layer_idx, last_state, cache_x[:, -1:, :])
         x = self.forward_script_part2(x, r, k, v, g)
@@ -473,6 +510,8 @@ class Block(nn.Module):
         x = x + x_attn
 
         x = x + self.ffn(self.ln2(x), cache=cache)
+        if cache is not None:
+            cache.update(self.layer_idx, length=x.shape[-2])
         return x, v_first
 
 

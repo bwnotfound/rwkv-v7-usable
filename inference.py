@@ -25,30 +25,18 @@ def generate(
     stop_event.clear()
     input_ids = tokenizer([prompt], return_tensors="pt").to(device)["input_ids"]
     assert input_ids.shape[0] == 1
-    block_size = 16
     generate_length = 0
+    cache = RWKVCache()
     print(input_ids.shape)
     while not stop_event.is_set():
         seq_len = input_ids.shape[1]
-        pad_len = block_size - seq_len % block_size
-        model_input_ids = input_ids
-        if pad_len > 0:
-            model_input_ids = torch.cat(
-                [
-                    model_input_ids,
-                    torch.full(
-                        (1, pad_len),
-                        tokenizer.pad_token_id,
-                        dtype=torch.long,
-                        device=device,
-                    ),
-                ],
-                dim=1,
-            )
-        print(model_input_ids.shape)
-        assert model_input_ids.shape[1] % block_size == 0
-        output = model(model_input_ids)
-        output = output[:, seq_len - 1 : seq_len, :]
+        model_input_ids = input_ids[:, cache.get_seq_length() : seq_len]
+        print(
+            f"input_ids len: {seq_len}, model_input_ids len: {model_input_ids.shape[1]}"
+        )
+        assert model_input_ids.shape[1] != 0, f"input_ids length: {seq_len}"
+        output = model(model_input_ids, cache=cache)
+        output = output[:, -1].unsqueeze(1)
         output = torch.nn.functional.softmax(output / temperature, dim=-1).argmax(
             dim=-1
         )
@@ -61,6 +49,9 @@ def generate(
         )
         yield output_str
         input_ids = torch.cat([input_ids, output], dim=1)
+        assert (
+            input_ids.shape[1] == seq_len + 1
+        ), f"input_ids length: {input_ids.shape[1]}"
         generate_length += 1
         if generate_length >= max_new_tokens:
             break
@@ -167,7 +158,7 @@ def main():
                 max_new_tokens = gr.Slider(
                     minimum=1,
                     maximum=32768,
-                    value=4096,
+                    value=256,
                     step=1,
                     label="Max New Tokens",
                 )
