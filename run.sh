@@ -9,8 +9,8 @@
 #
 #######################################################################################################################
 
-n_layer=12
-hidden_size=768
+n_layer=24
+hidden_size=2048
 head_size=64
 
 max_length=512
@@ -44,6 +44,7 @@ enable_checkpointing=false # TODO: Trainer params. This function is overrided by
 gradient_clip_val=1.0
 print_params_info=false 
 jit_on=false # please set false for train task because jit mode consume more time in backward. train.py force jit_on = false because jit will affect the grad calc. We should only use jit on inference.
+load_partial=true
 
 N_NODE=1       # number of nodes
 GPU_PER_NODE=1 # number of GPUs per node
@@ -58,4 +59,4 @@ python train.py --ckpt_path "$ckpt_path" --tokenizer_path "$tokenizer_path" --wa
     --weight_decay 0.001 --save_strategy $save_strategy --save_steps $save_steps --head_size $head_size \
     --accelerator gpu --devices $GPU_PER_NODE --precision bf16 --strategy deepspeed_stage_2 --gradient_checkpointing $gradient_checkpointing --ds_bucket_mb $DS_BUCKET_MB \
     --accumulate_grad_batches $accumulate_grad_batches --enable_checkpointing $enable_checkpointing --save_limits $save_limits \
-    --gradient_clip_val $gradient_clip_val --print_params_info $print_params_info --jit_on $jit_on
+    --gradient_clip_val $gradient_clip_val --print_params_info $print_params_info --jit_on $jit_on --load_partial $load_partial

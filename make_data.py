@@ -21,6 +21,40 @@ def encode_batch(tokenizer, batch, max_length):
         )["input_ids"]
         data = [np.array(x) for x in encoded]
         result = [{"input_ids": out[:-1], "labels": out[1:]} for out in data]
+    elif "content" in batch[0] and "input" in batch[0]:
+        prompt_list, response_list = [], []
+        for item in batch:
+            prompt = f"user: {item['input']}\nassistant: "
+            response = f"{item['content']}"
+            prompt_list.append(prompt)
+            response_list.append(response)
+        prompt_ids = tokenizer(
+            prompt_list,
+            max_length=max_length,
+            truncation=True,
+            add_special_tokens=False,
+        )["input_ids"]
+        response_ids = tokenizer(
+            response_list,
+            max_length=max_length,
+            truncation=True,
+            add_special_tokens=False,
+        )["input_ids"]
+        input_ids, labels = [], []
+        for prompt, response in zip(prompt_ids, response_ids):
+            if len(response) >= max_length:
+                continue
+            if len(prompt) + len(response) > max_length:
+                prompt = prompt[-(max_length - len(response)) :]
+            input_ids.append(prompt + response)
+            labels.append(
+                [-100] * (len(prompt) - 1) + response + [tokenizer.eos_token_id]
+            )
+        input_ids = [np.array(x) for x in input_ids]
+        labels = [np.array(x) for x in labels]
+        result = [
+            {"input_ids": out, "labels": label} for out, label in zip(input_ids, labels)
+        ]
     elif "conversations" in batch[0]:
         conversations_list = [x["conversations"] for x in batch]
         prompt_list, response_list = [], []

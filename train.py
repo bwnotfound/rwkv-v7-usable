@@ -42,6 +42,7 @@ class ScriptArguments:
     hidden_size: int = field(default=512)
     dim_ffn: int = field(default=None)
     head_size: int = field(default=64)  # can try larger values for larger models
+    d_gate_lora: int = field(default=None)
     gradient_checkpointing: bool = field(
         default=True
     )  # gradient checkpt: saves VRAM, but slower
@@ -91,7 +92,7 @@ if __name__ == "__main__":
     if 0 > 1:  # for highlight
         args = ScriptArguments()
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
-    args.vocab_size = tokenizer.vocab_size
+    args.vocab_size = tokenizer.vocab_size + len(tokenizer.special_tokens_map)
 
     if "deepspeed" in args.strategy:
         import deepspeed
@@ -191,7 +192,7 @@ if __name__ == "__main__":
     args.vocab_size = train_data.vocab_size
 
     checkpoint_path = args.resume if args.resume else args.ckpt_path
-    if checkpoint_path:
+    if checkpoint_path and os.path.exists(os.path.join(checkpoint_path, "config.json")):
         print(f"########## Load config from {checkpoint_path}... ##########")
         config = RWKVConfig.from_pretrained(checkpoint_path)
     else:
@@ -203,6 +204,7 @@ if __name__ == "__main__":
             dim_ffn=args.dim_ffn,
             vocab_size=args.vocab_size,
             max_length=args.max_length,
+            d_gate_lora=args.d_gate_lora,
             gradient_checkpointing=args.gradient_checkpointing,
         )
     optim_config = OptimConfig(
@@ -216,9 +218,10 @@ if __name__ == "__main__":
         lr_decay_steps=args.lr_decay_steps,
     )
     model = RWKV(config, optim_config, print_params_info=args.print_params_info)
+    model.from_state_dict(model.generate_init_weight(args.accelerator))
     if not checkpoint_path or not os.path.exists(checkpoint_path):
         rank_zero_info(f"########## Init weight from scratch ##########")
-        model.from_state_dict(model.generate_init_weight(args.accelerator))
+        # model.from_state_dict(model.generate_init_weight(args.accelerator))
     else:
         rank_zero_info(
             f"########## Load state_dict from {args.ckpt_path}... ##########"

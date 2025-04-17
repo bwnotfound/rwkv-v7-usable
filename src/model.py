@@ -123,6 +123,7 @@ class RWKVConfig(PretrainedConfig):
         vocab_size=0,
         max_length=1024,
         chunk_len=16,
+        d_gate_lora=None,
         torch_dtype="bf16",
         gradient_checkpointing=True,
         **kwargs,
@@ -142,6 +143,9 @@ class RWKVConfig(PretrainedConfig):
         self.gradient_checkpointing = gradient_checkpointing
         self.chunk_len = chunk_len
         self.torch_dtype = torch_dtype
+        if d_gate_lora is None:
+            d_gate_lora = max(32, int(round((0.6 * (hidden_size**0.8)) / 32) * 32))
+        self.d_gate_lora = d_gate_lora
 
 
 @dataclass
@@ -272,7 +276,7 @@ class RWKV_Tmix_x070(MyModule):
             self.v0 = nn.Parameter(torch.zeros(1, 1, C) + 1.0)
 
             # Note: for some data, you can reduce D_GATE_LORA or even remove this gate
-            D_GATE_LORA = max(32, int(round((0.6 * (C**0.8)) / 32) * 32))  # suggestion
+            D_GATE_LORA = self.config.d_gate_lora  # suggestion
             self.g1 = nn.Parameter(torch.zeros(C, D_GATE_LORA))
             self.g2 = nn.Parameter(ortho_init(torch.zeros(D_GATE_LORA, C), 0.1))
 
@@ -682,7 +686,7 @@ class RWKV(L.LightningModule):
         for block in self.blocks:
             if config.gradient_checkpointing:
                 x, v_first = deepspeed.checkpointing.checkpoint(
-                    block, x, v_first, cache=cache
+                    block, x, v_first, self.meta_tensor, cache
                 )
             else:
                 x, v_first = block(x, v_first, self.meta_tensor, cache=cache)
